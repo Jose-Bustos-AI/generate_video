@@ -1,5 +1,4 @@
 import runpod
-from runpod.serverless.utils import rp_upload
 import os
 import websocket
 import base64
@@ -12,16 +11,18 @@ import binascii
 import subprocess
 import time
 import random
+from urllib.error import HTTPError
 
-# 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
 
+COMFY_ROOT = os.getenv("COMFY_ROOT", "/ComfyUI")
+COMFY_INPUT_DIR = os.path.join(COMFY_ROOT, "input")
+
 def to_nearest_multiple_of_16(value):
-    """주어진 값을 가장 가까운 16의 배수로 보정, 최소 16 보장"""
     try:
         numeric_value = float(value)
     except Exception:
@@ -31,55 +32,32 @@ def to_nearest_multiple_of_16(value):
         adjusted = 16
     return adjusted
 
-def process_input(input_data, temp_dir, output_filename, input_type):
-    """입력 데이터를 처리하여 파일 경로를 반환하는 함수"""
-    if input_type == "path":
-        logger.info(f"📁 경로 입력 처리: {input_data}")
-        return input_data
-    elif input_type == "url":
-        logger.info(f"🌐 URL 입력 처리: {input_data}")
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        return download_file_from_url(input_data, file_path)
-    elif input_type == "base64":
-        logger.info(f"🔢 Base64 입력 처리")
-        return save_base64_to_file(input_data, temp_dir, output_filename)
-    else:
-        raise Exception(f"지원하지 않는 입력 타입: {input_type}")
-
 def download_file_from_url(url, output_path):
-    """URL에서 파일을 다운로드하는 함수"""
     try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         result = subprocess.run(
             ['wget', '-O', output_path, '--no-verbose', url],
             capture_output=True,
             text=True
         )
         if result.returncode == 0:
-            logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
+            logger.info(f"✅ Downloaded: {url} -> {output_path}")
             return output_path
-        else:
-            logger.error(f"❌ wget 다운로드 실패: {result.stderr}")
-            raise Exception(f"URL 다운로드 실패: {result.stderr}")
+        raise Exception(f"wget failed: {result.stderr}")
     except subprocess.TimeoutExpired:
-        logger.error("❌ 다운로드 시간 초과")
         raise Exception("다운로드 시간 초과")
     except Exception as e:
-        logger.error(f"❌ 다운로드 중 오류 발생: {e}")
         raise Exception(f"다운로드 중 오류 발생: {e}")
 
-def save_base64_to_file(base64_data, temp_dir, output_filename):
-    """Base64 데이터를 파일로 저장하는 함수"""
+def save_base64_to_file(base64_data, output_path):
     try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         decoded_data = base64.b64decode(base64_data)
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        with open(file_path, 'wb') as f:
+        with open(output_path, 'wb') as f:
             f.write(decoded_data)
-        logger.info(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
-        return file_path
+        logger.info(f"✅ Saved base64 to: {output_path}")
+        return output_path
     except (binascii.Error, ValueError) as e:
-        logger.error(f"❌ Base64 디코딩 실패: {e}")
         raise Exception(f"Base64 디코딩 실패: {e}")
 
 def queue_prompt(prompt):
@@ -87,8 +65,16 @@ def queue_prompt(prompt):
     logger.info(f"Queueing prompt to: {url}")
     p = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(p).encode('utf-8')
-    req = urllib.request.Request(url, data=data)
-    return json.loads(urllib.request.urlopen(req).read())
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        return json.loads(urllib.request.urlopen(req).read())
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = "(could not read body)"
+        raise Exception(f"ComfyUI /prompt returned {e.code}: {body}")
 
 def get_history(prompt_id):
     url = f"http://{server_address}:8188/history/{prompt_id}"
@@ -108,8 +94,7 @@ def get_videos(ws, prompt):
                 data = message.get('data', {})
                 if data.get('node') is None and data.get('prompt_id') == prompt_id:
                     break
-        else:
-            continue
+        # ignore binary frames
 
     history = get_history(prompt_id)[prompt_id]
     for node_id in history.get('outputs', {}):
@@ -128,213 +113,209 @@ def load_workflow(workflow_path):
     with open(workflow_path, 'r') as file:
         return json.load(file)
 
-def handler(job):
-    job_input = job.get("input", {}) or {}
-    logger.info(f"Received job input: {job_input}")
-
-    task_id = f"task_{uuid.uuid4()}"
-    temp_dir = os.path.join("/tmp", "runpod_inputs", task_id)
-    os.makedirs(temp_dir, exist_ok=True)
-
-    # -----------------------------
-    # 1) PROMPT (REQUIRED)
-    # -----------------------------
-    user_prompt = job_input.get("prompt")
-    if not user_prompt or not isinstance(user_prompt, str):
-        raise Exception("Missing required input: 'prompt' (string)")
-
-    negative_prompt = job_input.get(
-        "negative_prompt",
-        "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
-
-    # -----------------------------
-    # 2) IMAGE INPUT (SUPPORTS RunPod 'images' ARRAY)
-    # -----------------------------
-    image_path = None
-
-    # Preferred: RunPod style: images: [{name, url}, ...]
-    images_arr = job_input.get("images")
-    if isinstance(images_arr, list) and len(images_arr) > 0:
-        first = images_arr[0] or {}
-        url = first.get("url")
-        if url:
-            image_path = process_input(url, temp_dir, "input_0.png", "url")
-
-    # Back-compat: image_path / image_url / image_base64
-    if not image_path:
-        if "image_path" in job_input:
-            image_path = process_input(job_input["image_path"], temp_dir, "input_image.jpg", "path")
-        elif "image_url" in job_input:
-            image_path = process_input(job_input["image_url"], temp_dir, "input_image.jpg", "url")
-        elif "image_base64" in job_input:
-            image_path = process_input(job_input["image_base64"], temp_dir, "input_image.jpg", "base64")
-
-    if not image_path:
-        image_path = "/example_image.png"
-        logger.info("기본 이미지 파일을 사용합니다: /example_image.png")
-
-    # Optional end image (FLF2V)
-    end_image_path_local = None
-    if "end_image_path" in job_input:
-        end_image_path_local = process_input(job_input["end_image_path"], temp_dir, "end_image.jpg", "path")
-    elif "end_image_url" in job_input:
-        end_image_path_local = process_input(job_input["end_image_url"], temp_dir, "end_image.jpg", "url")
-    elif "end_image_base64" in job_input:
-        end_image_path_local = process_input(job_input["end_image_base64"], temp_dir, "end_image.jpg", "base64")
-
-    # -----------------------------
-    # 3) DEFAULTS (NO KeyError)
-    # -----------------------------
-    seed = job_input.get("seed", -1)
-    if isinstance(seed, str) and seed.strip().lstrip("-").isdigit():
-        seed = int(seed.strip())
-    if not isinstance(seed, int):
-        seed = -1
-    if seed == -1:
-        seed = random.randint(0, 2**31 - 1)
-
-    cfg = job_input.get("cfg", 7)
-    try:
-        cfg = float(cfg)
-    except Exception:
-        cfg = 7.0
-
-    length = job_input.get("length", 81)
-    try:
-        length = int(length)
-    except Exception:
-        length = 81
-
-    steps = job_input.get("steps", 10)
-    try:
-        steps = int(steps)
-    except Exception:
-        steps = 10
-
-    # Reasonable defaults for WAN i2v
-    original_width = job_input.get("width", 832)
-    original_height = job_input.get("height", 480)
-
-    adjusted_width = to_nearest_multiple_of_16(original_width)
-    adjusted_height = to_nearest_multiple_of_16(original_height)
-
-    context_overlap = job_input.get("context_overlap", 48)
-    try:
-        context_overlap = int(context_overlap)
-    except Exception:
-        context_overlap = 48
-
-    # LoRA pairs (optional)
-    lora_pairs = job_input.get("lora_pairs", [])
-    if not isinstance(lora_pairs, list):
-        lora_pairs = []
-    lora_pairs = lora_pairs[:4]
-    lora_count = len(lora_pairs)
-
-    # -----------------------------
-    # 4) LOAD WORKFLOW + INJECT
-    # -----------------------------
-    workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
-    logger.info(f"Using {'FLF2V' if end_image_path_local else 'single'} workflow with {lora_count} LoRA pairs")
-    prompt = load_workflow(workflow_file)
-
-    # Required nodes exist?
-    for nid in ["244", "541", "135", "220", "540", "235", "236", "498"]:
-        if nid not in prompt:
-            raise Exception(f"Workflow JSON missing required node id: {nid}")
-
-    # Inject values
-    prompt["244"]["inputs"]["image"] = image_path
-    prompt["541"]["inputs"]["num_frames"] = length
-    prompt["135"]["inputs"]["positive_prompt"] = user_prompt
-    prompt["135"]["inputs"]["negative_prompt"] = negative_prompt
-
-    prompt["220"]["inputs"]["seed"] = seed
-    prompt["540"]["inputs"]["seed"] = seed
-    prompt["540"]["inputs"]["cfg"] = cfg
-
-    prompt["235"]["inputs"]["value"] = adjusted_width
-    prompt["236"]["inputs"]["value"] = adjusted_height
-
-    prompt["498"]["inputs"]["context_overlap"] = context_overlap
-    prompt["498"]["inputs"]["context_frames"] = length
-
-    # step settings (optional nodes)
-    if "834" in prompt and "829" in prompt:
-        prompt["834"]["inputs"]["steps"] = steps
-        lowsteps = int(steps * 0.6)
-        prompt["829"]["inputs"]["step"] = lowsteps
-        logger.info(f"Steps set to: {steps} | LowSteps set to: {lowsteps}")
-
-    # end image (optional)
-    if end_image_path_local:
-        if "617" not in prompt:
-            raise Exception("FLF2V selected but node 617 not found in workflow JSON")
-        prompt["617"]["inputs"]["image"] = end_image_path_local
-
-    # LoRA injection (optional)
-    if lora_count > 0:
-        high_lora_node_id = "279"
-        low_lora_node_id = "553"
-        if high_lora_node_id in prompt and low_lora_node_id in prompt:
-            for i, lora_pair in enumerate(lora_pairs):
-                lora_high = (lora_pair or {}).get("high")
-                lora_low = (lora_pair or {}).get("low")
-                lora_high_weight = (lora_pair or {}).get("high_weight", 1.0)
-                lora_low_weight = (lora_pair or {}).get("low_weight", 1.0)
-
-                if lora_high:
-                    prompt[high_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_high
-                    prompt[high_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_high_weight
-                if lora_low:
-                    prompt[low_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_low
-                    prompt[low_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_low_weight
-        else:
-            logger.warning("LoRA pairs provided but expected LoRA nodes (279/553) not found in workflow JSON")
-
-    # -----------------------------
-    # 5) CONNECT + RUN
-    # -----------------------------
-    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
-    logger.info(f"Connecting to WebSocket: {ws_url}")
-
+def _ensure_comfy_ready():
     http_url = f"http://{server_address}:8188/"
     logger.info(f"Checking HTTP connection to: {http_url}")
-
     max_http_attempts = 180
-    for http_attempt in range(max_http_attempts):
+    for attempt in range(max_http_attempts):
         try:
-            response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-            break
+            urllib.request.urlopen(http_url, timeout=5)
+            logger.info(f"HTTP 연결 성공 (시도 {attempt+1})")
+            return
         except Exception as e:
-            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
-            if http_attempt == max_http_attempts - 1:
-                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
+            logger.warning(f"HTTP 연결 실패 (시도 {attempt+1}/{max_http_attempts}): {e}")
             time.sleep(1)
+    raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
 
+def _connect_ws():
+    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
+    logger.info(f"Connecting to WebSocket: {ws_url}")
     ws = websocket.WebSocket()
-    max_attempts = int(180/5)
+    max_attempts = int(180 / 5)
     for attempt in range(max_attempts):
         try:
             ws.connect(ws_url)
             logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
-            break
+            return ws
         except Exception as e:
             logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
             time.sleep(5)
+    raise Exception("웹소켓 연결 시간 초과 (3분)")
 
-    videos = get_videos(ws, prompt)
-    ws.close()
+def _pick_seed(seed_val):
+    # WanVideoSampler in your workflow rejects seed < 0.
+    try:
+        if seed_val is None:
+            return random.randint(0, 2**31 - 1)
+        seed_int = int(seed_val)
+        if seed_int < 0:
+            return random.randint(0, 2**31 - 1)
+        return seed_int
+    except Exception:
+        return random.randint(0, 2**31 - 1)
+
+def _materialize_input_image(job_input, task_id):
+    """
+    Preferred: RunPod-style job_input.images[0] = {name,url}
+    Fallback: image_url/image_base64/image_path
+    Returns (filename_in_comfy_input, full_path)
+    """
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+
+    # 1) RunPod images list
+    images = job_input.get("images")
+    if isinstance(images, list) and len(images) > 0 and isinstance(images[0], dict):
+        name = images[0].get("name") or "input_0.png"
+        url = images[0].get("url")
+        if not url:
+            raise Exception("images[0].url is missing")
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        download_file_from_url(url, full_path)
+        return name, full_path
+
+    # 2) Legacy keys
+    if "image_url" in job_input:
+        name = "input_0.png"
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        download_file_from_url(job_input["image_url"], full_path)
+        return name, full_path
+
+    if "image_base64" in job_input:
+        name = "input_0.png"
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        save_base64_to_file(job_input["image_base64"], full_path)
+        return name, full_path
+
+    if "image_path" in job_input:
+        # copy into comfy input to be safe
+        name = "input_0.png"
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        subprocess.run(["cp", "-f", job_input["image_path"], full_path], check=True)
+        return name, full_path
+
+    # 3) Default demo
+    name = "example_image.png"
+    full_path = os.path.join(COMFY_INPUT_DIR, name)
+    if os.path.exists("/example_image.png"):
+        subprocess.run(["cp", "-f", "/example_image.png", full_path], check=True)
+        logger.info("기본 이미지 파일을 사용합니다: /example_image.png")
+        return name, full_path
+
+    raise Exception("No image provided. Send job_input.images[0].url (preferred) or image_url/image_base64/image_path.")
+
+def _materialize_end_image_if_any(job_input):
+    """
+    Optional end image (FLF2V)
+    Returns (filename, full_path) or (None, None)
+    """
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+
+    if "end_image_url" in job_input:
+        name = "end_image.png"
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        download_file_from_url(job_input["end_image_url"], full_path)
+        return name, full_path
+
+    if "end_image_base64" in job_input:
+        name = "end_image.png"
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        save_base64_to_file(job_input["end_image_base64"], full_path)
+        return name, full_path
+
+    if "end_image_path" in job_input:
+        name = "end_image.png"
+        full_path = os.path.join(COMFY_INPUT_DIR, name)
+        subprocess.run(["cp", "-f", job_input["end_image_path"], full_path], check=True)
+        return name, full_path
+
+    return None, None
+
+def handler(job):
+    job_input = job.get("input", {}) or {}
+    logger.info(f"Received job input: {job_input}")
+
+    # Required prompt
+    user_prompt = job_input.get("prompt")
+    if not user_prompt or not isinstance(user_prompt, str):
+        raise Exception("Missing required field: prompt (string)")
+
+    task_id = f"task_{uuid.uuid4()}"
+
+    # Image in
+    image_name, _image_full = _materialize_input_image(job_input, task_id)
+
+    # Optional end image (FLF2V)
+    end_image_name, _end_full = _materialize_end_image_if_any(job_input)
+
+    # Workflow file
+    workflow_file = "/new_Wan22_flf2v_api.json" if end_image_name else "/new_Wan22_api.json"
+    logger.info(f"Using {'FLF2V' if end_image_name else 'single'} workflow")
+
+    prompt = load_workflow(workflow_file)
+
+    # Defaults + sanitize
+    length = int(job_input.get("length", 81))
+    steps = int(job_input.get("steps", 10))
+    cfg = float(job_input.get("cfg", 7))
+    seed = _pick_seed(job_input.get("seed"))
+
+    width_in = job_input.get("width", 832)
+    height_in = job_input.get("height", 480)
+    adjusted_width = to_nearest_multiple_of_16(width_in)
+    adjusted_height = to_nearest_multiple_of_16(height_in)
+
+    negative_default = "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+    negative_prompt = job_input.get("negative_prompt", negative_default)
+
+    # ---- Apply to your known node IDs ----
+    # IMPORTANT: LoadImage nodes usually expect filename in /ComfyUI/input
+    prompt["244"]["inputs"]["image"] = image_name
+    prompt["541"]["inputs"]["num_frames"] = length
+    prompt["135"]["inputs"]["positive_prompt"] = user_prompt
+    prompt["135"]["inputs"]["negative_prompt"] = negative_prompt
+
+    # seed + cfg
+    prompt["220"]["inputs"]["seed"] = seed
+    prompt["540"]["inputs"]["seed"] = seed
+    prompt["540"]["inputs"]["cfg"] = cfg
+
+    # width/height
+    prompt["235"]["inputs"]["value"] = adjusted_width
+    prompt["236"]["inputs"]["value"] = adjusted_height
+
+    # context
+    prompt["498"]["inputs"]["context_overlap"] = int(job_input.get("context_overlap", 48))
+    prompt["498"]["inputs"]["context_frames"] = length
+
+    # steps section (if exists)
+    if "834" in prompt:
+        prompt["834"]["inputs"]["steps"] = steps
+        lowsteps = int(steps * 0.6)
+        if "829" in prompt:
+            prompt["829"]["inputs"]["step"] = lowsteps
+        logger.info(f"Steps set to: {steps} | LowSteps: {lowsteps}")
+
+    # end image (FLF2V)
+    if end_image_name:
+        prompt["617"]["inputs"]["image"] = end_image_name
+
+    # Ensure Comfy is up, run
+    _ensure_comfy_ready()
+    ws = _connect_ws()
+    try:
+        videos = get_videos(ws, prompt)
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
 
     for node_id in videos:
         if videos[node_id]:
-            return {"video": videos[node_id][0]}
+            return {"video": videos[node_id][0], "seed_used": seed}
 
-    return {"error": "비디오를 찾을 수 없습니다."}
+    return {"error": "비디오를 찾을 수 없습니다.", "seed_used": seed}
 
 runpod.serverless.start({"handler": handler})
+
 
