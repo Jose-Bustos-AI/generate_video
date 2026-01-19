@@ -13,6 +13,8 @@ import time
 import random
 from urllib.error import HTTPError
 
+import requests  # <-- necesario para subir a Supabase
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,47 @@ client_id = str(uuid.uuid4())
 
 COMFY_ROOT = os.getenv("COMFY_ROOT", "/ComfyUI")
 COMFY_INPUT_DIR = os.path.join(COMFY_ROOT, "input")
+
+# Optional but HIGHLY recommended stamp (no rompe nada)
+HANDLER_VERSION = os.getenv("HANDLER_VERSION", "img2vid-upload-to-supabase-v1")
+print(f"HANDLER VERSION: {HANDLER_VERSION}", flush=True)
+
+# -------------------------
+# Supabase upload (bytes -> public url)
+# -------------------------
+def supabase_upload_bytes(content: bytes, filename: str, content_type: str = "video/mp4") -> str:
+    """
+    Upload bytes to Supabase Storage using REST.
+    Requires env vars in RunPod endpoint:
+      SUPABASE_URL
+      SUPABASE_SERVICE_ROLE_KEY
+    Optional:
+      SUPABASE_BUCKET (default results)
+      SUPABASE_PATH_PREFIX (default runpod)
+    """
+    supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
+    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    bucket = os.environ.get("SUPABASE_BUCKET", "results")
+    prefix = os.environ.get("SUPABASE_PATH_PREFIX", "runpod").strip("/")
+
+    path = f"{prefix}/{time.strftime('%Y/%m/%d')}/{filename}"
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{path}"
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+
+    # Supabase storage object upload: use POST with upsert
+    r = requests.post(upload_url, headers=headers, params={"upsert": "true"}, data=content, timeout=300)
+    if r.status_code not in (200, 201):
+        raise Exception(f"Supabase upload failed: {r.status_code} {r.text}")
+
+    public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{path}"
+    return public_url
+
 
 def to_nearest_multiple_of_16(value):
     try:
@@ -31,6 +74,7 @@ def to_nearest_multiple_of_16(value):
     if adjusted < 16:
         adjusted = 16
     return adjusted
+
 
 def download_file_from_url(url, output_path):
     try:
@@ -49,16 +93,37 @@ def download_file_from_url(url, output_path):
     except Exception as e:
         raise Exception(f"다운로드 중 오류 발생: {e}")
 
+
 def save_base64_to_file(base64_data, output_path):
+    """
+    Supports:
+      - raw base64
+      - data-uri: data:...;base64,....
+      - auto padding
+    """
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        decoded_data = base64.b64decode(base64_data)
+
+        if not isinstance(base64_data, str):
+            raise Exception("base64_data is not a string")
+
+        b64 = base64_data.strip()
+        if "base64," in b64:
+            b64 = b64.split("base64,", 1)[1].strip()
+
+        missing = (-len(b64)) % 4
+        if missing:
+            b64 += "=" * missing
+
+        decoded_data = base64.b64decode(b64, validate=False)
         with open(output_path, 'wb') as f:
             f.write(decoded_data)
+
         logger.info(f"✅ Saved base64 to: {output_path}")
         return output_path
     except (binascii.Error, ValueError) as e:
         raise Exception(f"Base64 디코딩 실패: {e}")
+
 
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
@@ -76,15 +141,20 @@ def queue_prompt(prompt):
             body = "(could not read body)"
         raise Exception(f"ComfyUI /prompt returned {e.code}: {body}")
 
+
 def get_history(prompt_id):
     url = f"http://{server_address}:8188/history/{prompt_id}"
     logger.info(f"Getting history from: {url}")
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
 
-def get_videos(ws, prompt):
+
+def get_video_paths(ws, prompt):
+    """
+    Instead of returning base64, return file paths from ComfyUI history outputs.
+    We will upload the first mp4 found to Supabase.
+    """
     prompt_id = queue_prompt(prompt)['prompt_id']
-    output_videos = {}
 
     while True:
         out = ws.recv()
@@ -97,21 +167,37 @@ def get_videos(ws, prompt):
         # ignore binary frames
 
     history = get_history(prompt_id)[prompt_id]
-    for node_id in history.get('outputs', {}):
-        node_output = history['outputs'][node_id]
-        videos_output = []
-        if 'gifs' in node_output:
-            for video in node_output['gifs']:
-                with open(video['fullpath'], 'rb') as f:
-                    video_data = base64.b64encode(f.read()).decode('utf-8')
-                videos_output.append(video_data)
-        output_videos[node_id] = videos_output
+    outputs = history.get('outputs', {})
 
-    return output_videos
+    video_paths_by_node = {}
+
+    for node_id, node_output in outputs.items():
+        paths = []
+
+        # Many workflows put mp4/gif under "gifs"
+        if isinstance(node_output, dict) and "gifs" in node_output and isinstance(node_output["gifs"], list):
+            for item in node_output["gifs"]:
+                fullpath = item.get("fullpath")
+                if fullpath and os.path.exists(fullpath):
+                    paths.append(fullpath)
+
+        # Some workflows may use "videos"
+        if isinstance(node_output, dict) and "videos" in node_output and isinstance(node_output["videos"], list):
+            for item in node_output["videos"]:
+                fullpath = item.get("fullpath")
+                if fullpath and os.path.exists(fullpath):
+                    paths.append(fullpath)
+
+        # Some workflows may use "images" for sequences, but here we want mp4 only.
+        video_paths_by_node[str(node_id)] = paths
+
+    return video_paths_by_node
+
 
 def load_workflow(workflow_path):
     with open(workflow_path, 'r') as file:
         return json.load(file)
+
 
 def _ensure_comfy_ready():
     http_url = f"http://{server_address}:8188/"
@@ -126,6 +212,7 @@ def _ensure_comfy_ready():
             logger.warning(f"HTTP 연결 실패 (시도 {attempt+1}/{max_http_attempts}): {e}")
             time.sleep(1)
     raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
+
 
 def _connect_ws():
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
@@ -142,6 +229,7 @@ def _connect_ws():
             time.sleep(5)
     raise Exception("웹소켓 연결 시간 초과 (3분)")
 
+
 def _pick_seed(seed_val):
     # WanVideoSampler in your workflow rejects seed < 0.
     try:
@@ -153,6 +241,7 @@ def _pick_seed(seed_val):
         return seed_int
     except Exception:
         return random.randint(0, 2**31 - 1)
+
 
 def _materialize_input_image(job_input, task_id):
     """
@@ -187,7 +276,6 @@ def _materialize_input_image(job_input, task_id):
         return name, full_path
 
     if "image_path" in job_input:
-        # copy into comfy input to be safe
         name = "input_0.png"
         full_path = os.path.join(COMFY_INPUT_DIR, name)
         subprocess.run(["cp", "-f", job_input["image_path"], full_path], check=True)
@@ -202,6 +290,7 @@ def _materialize_input_image(job_input, task_id):
         return name, full_path
 
     raise Exception("No image provided. Send job_input.images[0].url (preferred) or image_url/image_base64/image_path.")
+
 
 def _materialize_end_image_if_any(job_input):
     """
@@ -230,9 +319,10 @@ def _materialize_end_image_if_any(job_input):
 
     return None, None
 
+
 def handler(job):
     job_input = job.get("input", {}) or {}
-    logger.info(f"Received job input: {job_input}")
+    logger.info(f"Received job input keys: {list(job_input.keys())} | version={HANDLER_VERSION}")
 
     # Required prompt
     user_prompt = job_input.get("prompt")
@@ -249,7 +339,7 @@ def handler(job):
 
     # Workflow file
     workflow_file = "/new_Wan22_flf2v_api.json" if end_image_name else "/new_Wan22_api.json"
-    logger.info(f"Using {'FLF2V' if end_image_name else 'single'} workflow")
+    logger.info(f"Using {'FLF2V' if end_image_name else 'single'} workflow: {workflow_file}")
 
     prompt = load_workflow(workflow_file)
 
@@ -268,7 +358,6 @@ def handler(job):
     negative_prompt = job_input.get("negative_prompt", negative_default)
 
     # ---- Apply to your known node IDs ----
-    # IMPORTANT: LoadImage nodes usually expect filename in /ComfyUI/input
     prompt["244"]["inputs"]["image"] = image_name
     prompt["541"]["inputs"]["num_frames"] = length
     prompt["135"]["inputs"]["positive_prompt"] = user_prompt
@@ -303,19 +392,42 @@ def handler(job):
     _ensure_comfy_ready()
     ws = _connect_ws()
     try:
-        videos = get_videos(ws, prompt)
+        video_paths_by_node = get_video_paths(ws, prompt)
     finally:
         try:
             ws.close()
         except Exception:
             pass
 
-    for node_id in videos:
-        if videos[node_id]:
-            return {"video": videos[node_id][0], "seed_used": seed}
+    # Find first existing video path and upload
+    for node_id, paths in video_paths_by_node.items():
+        for p in paths:
+            if p and os.path.exists(p):
+                logger.info(f"Found video file: {p} (node {node_id})")
+                with open(p, "rb") as f:
+                    mp4_bytes = f.read()
 
-    return {"error": "비디오를 찾을 수 없습니다.", "seed_used": seed}
+                filename = f"{uuid.uuid4()}.mp4"
+                video_url = supabase_upload_bytes(mp4_bytes, filename, "video/mp4")
+
+                logger.info(f"RETURNING video_url: {video_url} | version={HANDLER_VERSION}")
+                return {
+                    "video_url": video_url,
+                    "seed_used": seed,
+                    "node_id": node_id,
+                    "width": adjusted_width,
+                    "height": adjusted_height,
+                    "length": length
+                }
+
+    return {
+        "error": "비디오를 찾을 수 없습니다. (No video file in outputs)",
+        "seed_used": seed,
+        "version": HANDLER_VERSION
+    }
+
 
 runpod.serverless.start({"handler": handler})
+
 
 
